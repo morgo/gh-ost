@@ -94,6 +94,7 @@ func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEven
 			string(rowsEvent.Table.Schema),
 			string(rowsEvent.Table.Table),
 			dml,
+			&this.currentCoordinates,
 		)
 		switch dml {
 		case InsertDML:

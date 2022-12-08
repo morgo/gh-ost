@@ -172,7 +172,7 @@ help                                 # This message
 	case "coordinates":
 		{
 			if argIsQuestion || arg == "" {
-				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetRecentBinlogCoordinates())
+				fmt.Fprintf(writer, "%+v\n", this.migrationContext.GetBinlogWatermark())
 				return NoPrintStatusRule, nil
 			}
 			return NoPrintStatusRule, fmt.Errorf("coordinates are read-only")

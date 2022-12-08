@@ -135,6 +135,8 @@ func main() {
 
 	flag.UintVar(&migrationContext.ReplicaServerId, "replica-server-id", 99999, "server id used by gh-ost process. Default: 99999")
 
+	flag.BoolVar(&migrationContext.ResumeFromCheckpoint, "resume-from-checkpoint", false, "Automatically resume previous migrations if possible.")
+
 	maxLoad := flag.String("max-load", "", "Comma delimited status-name=threshold. e.g: 'Threads_running=100,Threads_connected=500'. When status exceeds threshold, app throttles writes")
 	criticalLoad := flag.String("critical-load", "", "Comma delimited status-name=threshold, same format as --max-load. When status exceeds threshold, app panics and quits")
 	flag.Int64Var(&migrationContext.CriticalLoadIntervalMilliseconds, "critical-load-interval-millis", 0, "When 0, migration immediately bails out upon meeting critical-load. When non-zero, a second check is done after given interval, and migration only bails out if 2nd check still meets critical load")
@@ -199,6 +201,20 @@ func main() {
 		} else {
 			log.Fatal("--database must be provided and database name must not be empty, or --alter must specify database name")
 		}
+	}
+
+	if migrationContext.ResumeFromCheckpoint && migrationContext.InitiallyDropGhostTable {
+		migrationContext.InitiallyDropGhostTable = false
+		log.Warningf("--resume-from-checkpoint given, implicitly disabling --initially-drop-ghost-table")
+	}
+	if migrationContext.ResumeFromCheckpoint && !migrationContext.DropServeSocket {
+		migrationContext.DropServeSocket = true
+		log.Warningf("--resume-from-checkpoint given, implicitly enabling --initially-drop-socket-file")
+	}
+
+	if migrationContext.ResumeFromCheckpoint && migrationContext.InitiallyDropOldTable {
+		migrationContext.InitiallyDropOldTable = false
+		log.Warningf("--resume-from-checkpoint given, implicitly disabling --initially-drop-old-table")
 	}
 
 	if err := flag.Set("database", url.QueryEscape(migrationContext.DatabaseName)); err != nil {

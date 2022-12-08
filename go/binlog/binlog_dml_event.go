@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
 )
 
@@ -51,13 +52,15 @@ type BinlogDMLEvent struct {
 	DML               EventDML
 	WhereColumnValues *sql.ColumnValues
 	NewColumnValues   *sql.ColumnValues
+	Coordinates       *mysql.BinlogCoordinates
 }
 
-func NewBinlogDMLEvent(databaseName, tableName string, dml EventDML) *BinlogDMLEvent {
+func NewBinlogDMLEvent(databaseName, tableName string, dml EventDML, coordinates *mysql.BinlogCoordinates) *BinlogDMLEvent {
 	event := &BinlogDMLEvent{
 		DatabaseName: databaseName,
 		TableName:    tableName,
 		DML:          dml,
+		Coordinates:  coordinates,
 	}
 	return event
 }

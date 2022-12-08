@@ -64,6 +64,12 @@ type ThrottleCheckResult struct {
 	ReasonHint     ThrottleReasonHint
 }
 
+type Checkpoint struct {
+	Binlog          string `json:"binlog"`
+	CopyRows        string `json:"copyRows"`
+	TotalRowsCopied int64  `json:"totalRowsCopied"` // preserve total rows copied.
+}
+
 func NewThrottleCheckResult(throttle bool, reason string, reasonHint ThrottleReasonHint) *ThrottleCheckResult {
 	return &ThrottleCheckResult{
 		ShouldThrottle: throttle,
@@ -188,6 +194,7 @@ type MigrationContext struct {
 	CurrentLag                             int64
 	currentProgress                        uint64
 	etaNanoseonds                          int64
+	EtaRowsPerSecond                       int64
 	ThrottleHTTPIntervalMillis             int64
 	ThrottleHTTPStatusCode                 int64
 	ThrottleHTTPTimeoutMillis              int64
@@ -230,7 +237,10 @@ type MigrationContext struct {
 	MigrationIterationRangeMaxValues *sql.ColumnValues
 	ForceTmpTableName                string
 
-	recentBinlogCoordinates mysql.BinlogCoordinates
+	ResumeFromCheckpoint    bool
+	IsResumedFromCheckpoint bool
+	resumeBinlogWatermark   *mysql.BinlogCoordinates
+	resumeCopyRowsWatermark *sql.ColumnValues
 
 	Log Logger
 }
@@ -287,6 +297,7 @@ func NewMigrationContext() *MigrationContext {
 		ColumnRenameMap:                     make(map[string]string),
 		PanicAbort:                          make(chan error),
 		Log:                                 NewDefaultLogger(),
+		ResumeFromCheckpoint:                false,
 	}
 }
 
@@ -733,17 +744,70 @@ func (this *MigrationContext) SetNiceRatio(newRatio float64) {
 	this.niceRatio = newRatio
 }
 
-func (this *MigrationContext) GetRecentBinlogCoordinates() mysql.BinlogCoordinates {
+func (this *MigrationContext) ReadyToCheckpoint() bool {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
-
-	return this.recentBinlogCoordinates
+	return this.resumeCopyRowsWatermark != nil && this.resumeBinlogWatermark != nil
 }
 
-func (this *MigrationContext) SetRecentBinlogCoordinates(coordinates mysql.BinlogCoordinates) {
+func (this *MigrationContext) LoadCheckpoint(cp *Checkpoint) (err error) {
 	this.throttleMutex.Lock()
 	defer this.throttleMutex.Unlock()
-	this.recentBinlogCoordinates = coordinates
+	this.resumeCopyRowsWatermark, err = sql.NewColumnValuesFromBase64(cp.CopyRows)
+	if err != nil {
+		return err
+	}
+	this.resumeBinlogWatermark, err = mysql.ParseBinlogCoordinates(cp.Binlog)
+	if err != nil {
+		return err
+	}
+	this.TotalRowsCopied = cp.TotalRowsCopied
+	return nil
+}
+
+func (this *MigrationContext) GetCheckpoint() (*Checkpoint, error) {
+	this.throttleMutex.Lock()
+	defer this.throttleMutex.Unlock()
+
+	// These are minimum locations known to be safe.
+	binlog := this.resumeBinlogWatermark.String()
+	copyRows, err := this.resumeCopyRowsWatermark.ToBase64()
+	if err != nil {
+		return nil, err
+	}
+	return &Checkpoint{
+		Binlog:          binlog,
+		CopyRows:        copyRows,
+		TotalRowsCopied: atomic.LoadInt64(&this.TotalRowsCopied),
+	}, nil
+}
+
+func (this *MigrationContext) GetCopyRowsWatermark() sql.ColumnValues {
+	this.throttleMutex.Lock()
+	defer this.throttleMutex.Unlock()
+
+	return *this.resumeCopyRowsWatermark
+}
+
+func (this *MigrationContext) SetCopyRowsLowWatermark(values sql.ColumnValues) {
+	this.throttleMutex.Lock()
+	defer this.throttleMutex.Unlock()
+
+	this.resumeCopyRowsWatermark = &values
+}
+
+func (this *MigrationContext) GetBinlogWatermark() mysql.BinlogCoordinates {
+	this.throttleMutex.Lock()
+	defer this.throttleMutex.Unlock()
+
+	return *this.resumeBinlogWatermark
+}
+
+func (this *MigrationContext) SetBinlogWatermark(coordinates mysql.BinlogCoordinates) {
+	this.throttleMutex.Lock()
+	defer this.throttleMutex.Unlock()
+
+	this.resumeBinlogWatermark = &coordinates
 }
 
 // ReadMaxLoad parses the `--max-load` flag, which is in multiple key-value format,

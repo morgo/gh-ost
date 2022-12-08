@@ -174,6 +174,9 @@ func (this *Applier) tableExists(tableName string) (tableFound bool) {
 // ValidateOrDropExistingTables verifies ghost and changelog tables do not exist,
 // or attempts to drop them if instructed to.
 func (this *Applier) ValidateOrDropExistingTables() error {
+	if this.migrationContext.IsResumedFromCheckpoint {
+		return nil
+	}
 	if this.migrationContext.InitiallyDropGhostTable {
 		if err := this.DropGhostTable(); err != nil {
 			return err
@@ -221,6 +224,9 @@ func (this *Applier) AttemptInstantDDL() error {
 
 // CreateGhostTable creates the ghost table on the applier host
 func (this *Applier) CreateGhostTable() error {
+	if this.migrationContext.IsResumedFromCheckpoint {
+		return nil
+	}
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s like %s.%s`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetGhostTableName()),
@@ -262,6 +268,9 @@ func (this *Applier) CreateGhostTable() error {
 
 // AlterGhost applies `alter` statement on ghost table
 func (this *Applier) AlterGhost() error {
+	if this.migrationContext.IsResumedFromCheckpoint {
+		return nil
+	}
 	query := fmt.Sprintf(`alter /* gh-ost */ table %s.%s %s`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetGhostTableName()),
@@ -322,6 +331,9 @@ func (this *Applier) AlterGhostAutoIncrement() error {
 
 // CreateChangelogTable creates the changelog table on the applier host
 func (this *Applier) CreateChangelogTable() error {
+	if this.migrationContext.IsResumedFromCheckpoint {
+		return nil
+	}
 	if err := this.DropChangelogTable(); err != nil {
 		return err
 	}
@@ -391,6 +403,8 @@ func (this *Applier) WriteChangelog(hint, value string) (string, error) {
 		explicitId = 2
 	case "throttle":
 		explicitId = 3
+	case "checkpoint":
+		explicitId = 4
 	}
 	query := fmt.Sprintf(`
 			insert /* gh-ost */ into %s.%s
@@ -471,6 +485,13 @@ func (this *Applier) ExecuteThrottleQuery() (int64, error) {
 
 // readMigrationMinValues returns the minimum values to be iterated on rowcopy
 func (this *Applier) readMigrationMinValues(tx *gosql.Tx, uniqueKey *sql.UniqueKey) error {
+	if this.migrationContext.IsResumedFromCheckpoint {
+		this.migrationContext.Log.Infof("Resuming from checkpoint; will not read migration range")
+		watermark := this.migrationContext.GetCopyRowsWatermark()
+		this.migrationContext.MigrationRangeMinValues = &watermark
+		return nil
+	}
+
 	this.migrationContext.Log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
 	query, err := sql.BuildUniqueKeyMinValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
 	if err != nil {
@@ -667,6 +688,9 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 		this.migrationContext.MigrationIterationRangeMaxValues,
 		this.migrationContext.GetIteration(),
 		chunkSize)
+
+	// Update the low watermark to the high mark of this iteration.
+	this.migrationContext.SetCopyRowsLowWatermark(*this.migrationContext.MigrationIterationRangeMaxValues)
 	return chunkSize, rowsAffected, duration, nil
 }
 
@@ -1181,6 +1205,13 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+
+		// Get the last binlog event and then update the low watermark for
+		// binlog events applied. This supports resume-from-checkpoint.
+		lastAppliedBinlogCoordinates := dmlEvents[len(dmlEvents)-1].Coordinates
+		if lastAppliedBinlogCoordinates != nil {
+			this.migrationContext.SetBinlogWatermark(*lastAppliedBinlogCoordinates)
 		}
 		return nil
 	}()

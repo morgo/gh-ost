@@ -110,8 +110,18 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 	if _, err := base.ValidateConnection(this.db, this.connectionConfig, this.migrationContext, this.name); err != nil {
 		return err
 	}
-	if err := this.readCurrentBinlogCoordinates(); err != nil {
-		return err
+
+	if this.migrationContext.IsResumedFromCheckpoint {
+		watermark := this.migrationContext.GetBinlogWatermark()
+		this.initialBinlogCoordinates = &watermark
+	} else {
+		// Standard flow: read from the master where it is now, set the coords
+		if err := this.readCurrentBinlogCoordinates(); err != nil {
+			return err
+		}
+		// Set the low watermark to the read-point so resume
+		// will start from here.
+		this.migrationContext.SetBinlogWatermark(*this.initialBinlogCoordinates)
 	}
 	if err := this.initBinlogReader(this.initialBinlogCoordinates); err != nil {
 		return err

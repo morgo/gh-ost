@@ -7,6 +7,7 @@ package logic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -220,7 +221,9 @@ func (this *Migrator) onChangelogStateEvent(dmlEvent *binlog.BinlogDMLEvent) (er
 	case Migrated, ReadMigrationRangeValues:
 		// no-op event
 	case GhostTableMigrated:
-		this.ghostTableMigrated <- true
+		if !this.migrationContext.IsResumedFromCheckpoint {
+			this.ghostTableMigrated <- true
+		}
 	case AllEventsUpToLockProcessed:
 		var applyEventFunc tableWriteFunc = func() error {
 			this.allEventsUpToLockProcessed <- changelogStateString
@@ -372,10 +375,15 @@ func (this *Migrator) Migrate() (err error) {
 		}
 	}
 
-	initialLag, _ := this.inspector.getReplicationLag()
-	this.migrationContext.Log.Infof("Waiting for ghost table to be migrated. Current lag is %+v", initialLag)
-	<-this.ghostTableMigrated
-	this.migrationContext.Log.Debugf("ghost table migrated")
+	if !this.migrationContext.IsResumedFromCheckpoint {
+		// In resume-from-checkpoint context the inspector
+		// has already verified that the tables exist,
+		// so we are good to go.
+		initialLag, _ := this.inspector.getReplicationLag()
+		this.migrationContext.Log.Infof("Waiting for ghost table to be migrated. Current lag is %+v", initialLag)
+		<-this.ghostTableMigrated
+		this.migrationContext.Log.Infof("ghost table migrated")
+	}
 	// Yay! We now know the Ghost and Changelog tables are good to examine!
 	// When running on replica, this means the replica has those tables. When running
 	// on master this is always true, of course, and yet it also implies this knowledge
@@ -412,6 +420,7 @@ func (this *Migrator) Migrate() (err error) {
 	go this.iterateChunks()
 	this.migrationContext.MarkRowCopyStartTime()
 	go this.initiateStatus()
+	go this.initiateContinuousCheckpoint()
 
 	this.migrationContext.Log.Debugf("Operating until row copy is complete")
 	this.consumeRowCopyComplete()
@@ -757,6 +766,9 @@ func (this *Migrator) initiateInspector() (err error) {
 	if err := this.inspector.InitDBConnections(); err != nil {
 		return err
 	}
+	if err := this.inspector.validateCheckpoint(); err != nil {
+		return err
+	}
 	if err := this.inspector.ValidateOriginalTable(); err != nil {
 		return err
 	}
@@ -808,16 +820,52 @@ func (this *Migrator) initiateInspector() (err error) {
 	return nil
 }
 
-// initiateStatus sets and activates the printStatus() ticker
-func (this *Migrator) initiateStatus() {
-	this.printStatus(ForcePrintStatusAndHintRule)
+func (this *Migrator) flushCheckpoint() error {
+	if !this.migrationContext.ReadyToCheckpoint() {
+		return nil
+	}
+	cp, err := this.migrationContext.GetCheckpoint()
+	if err != nil {
+		return err
+	}
+	jsonString, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	_, err = this.applier.WriteChangelog("checkpoint", string(jsonString))
+	return err
+}
+
+func (this *Migrator) initiateContinuousCheckpoint() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
 			return
 		}
+		if err := this.flushCheckpoint(); err != nil {
+			this.migrationContext.Log.Errorf("Error flushing checkpoint: %s", err.Error())
+		}
+	}
+}
+
+// initiateStatus sets and activates the printStatus() ticker
+func (this *Migrator) initiateStatus() {
+	this.printStatus(ForcePrintStatusAndHintRule)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var previousCount int64
+	for range ticker.C {
+		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+			return
+		}
 		go this.printStatus(HeuristicPrintStatusRule)
+		totalCopied := atomic.LoadInt64(&this.migrationContext.TotalRowsCopied)
+		if previousCount > 0 {
+			copiedThisLoop := totalCopied - previousCount
+			atomic.StoreInt64(&this.migrationContext.EtaRowsPerSecond, copiedThisLoop)
+		}
+		previousCount = totalCopied
 	}
 }
 
@@ -894,6 +942,9 @@ func (this *Migrator) printMigrationStatusHint(writers ...io.Writer) {
 			this.migrationContext.PanicFlagFile,
 		)
 	}
+	if this.migrationContext.IsResumedFromCheckpoint {
+		fmt.Fprintf(w, "# [NOTICE] We are resuming from a previous migration!\n")
+	}
 	fmt.Fprintf(w, "# Serving on unix socket: %+v\n",
 		this.migrationContext.ServeSocketFile,
 	)
@@ -919,9 +970,20 @@ func (this *Migrator) getMigrationETA(rowsEstimate int64) (eta string, duration 
 		duration = 0
 	} else if progressPct >= 0.1 {
 		totalRowsCopied := this.migrationContext.GetTotalRowsCopied()
-		elapsedRowCopySeconds := this.migrationContext.ElapsedRowCopyTime().Seconds()
-		totalExpectedSeconds := elapsedRowCopySeconds * float64(rowsEstimate) / float64(totalRowsCopied)
-		etaSeconds := totalExpectedSeconds - elapsedRowCopySeconds
+		etaRowsPerSecond := atomic.LoadInt64(&this.migrationContext.EtaRowsPerSecond)
+		var etaSeconds float64
+		// If there is data available on our current row-copies-per-second rate, use it.
+		// Otherwise we can fallback to the total elapsed time and extrapolate.
+		// This is going to be less accurate on a longer copy as the insert rate
+		// will tend to slow down.
+		if etaRowsPerSecond > 0 {
+			remainingRows := float64(rowsEstimate) - float64(totalRowsCopied)
+			etaSeconds = remainingRows / float64(etaRowsPerSecond)
+		} else {
+			elapsedRowCopySeconds := this.migrationContext.ElapsedRowCopyTime().Seconds()
+			totalExpectedSeconds := elapsedRowCopySeconds * float64(rowsEstimate) / float64(totalRowsCopied)
+			etaSeconds = totalExpectedSeconds - elapsedRowCopySeconds
+		}
 		if etaSeconds >= 0 {
 			duration = time.Duration(etaSeconds) * time.Second
 		} else {
@@ -1077,17 +1139,6 @@ func (this *Migrator) initiateStreaming() error {
 			this.migrationContext.PanicAbort <- err
 		}
 		this.migrationContext.Log.Debugf("Done streaming")
-	}()
-
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if atomic.LoadInt64(&this.finishedMigrating) > 0 {
-				return
-			}
-			this.migrationContext.SetRecentBinlogCoordinates(*this.eventsStreamer.GetCurrentBinlogCoordinates())
-		}
 	}()
 	return nil
 }

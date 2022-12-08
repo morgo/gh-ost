@@ -8,6 +8,7 @@ package logic
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -73,6 +74,47 @@ func (this *Inspector) InitDBConnections() (err error) {
 		return err
 	}
 	this.migrationContext.Log.Infof("Inspector initiated on %+v, version %+v", this.connectionConfig.ImpliedKey, this.migrationContext.InspectorMySQLVersion)
+	return nil
+}
+
+// showTableStatus returns the output of `show table status like '...'` command
+func (this *Inspector) showTableStatus(tableName string) (rowMap sqlutils.RowMap) {
+	query := fmt.Sprintf(`show /* gh-ost */ table status from %s like '%s'`, sql.EscapeName(this.migrationContext.DatabaseName), tableName)
+	sqlutils.QueryRowsMap(this.db, query, func(m sqlutils.RowMap) error {
+		rowMap = m
+		return nil
+	})
+	return rowMap
+}
+
+// tableExists checks if a given table exists in database
+func (this *Inspector) tableExists(tableName string) (tableFound bool) {
+	m := this.showTableStatus(tableName)
+	return (m != nil)
+}
+
+func (this *Inspector) validateCheckpoint() (err error) {
+	if !this.migrationContext.ResumeFromCheckpoint {
+		return nil
+	}
+	// Since resume-from-checkpoint is enabled.
+	// We need to validate there is a checkpoint written,
+	// and the _gho and _ghc tables still exist.
+	if this.tableExists(this.migrationContext.GetGhostTableName()) && this.tableExists(this.migrationContext.GetChangelogTableName()) {
+		checkpointStr, err := this.readChangelogState("checkpoint")
+		if err != nil {
+			return err
+		}
+		if checkpointStr == "" {
+			return fmt.Errorf("resume-from-checkpoint failed (checkpoint not present in changelog table)")
+		}
+		var checkpoint *base.Checkpoint
+		json.Unmarshal([]byte(checkpointStr), &checkpoint)
+		if err = this.migrationContext.LoadCheckpoint(checkpoint); err != nil {
+			return err
+		}
+		this.migrationContext.IsResumedFromCheckpoint = true
+	}
 	return nil
 }
 
